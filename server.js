@@ -22,15 +22,26 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
 const PORT = process.env.PORT || 3000;
-const SESSION_DIR = process.env.SESSION_DIR || "./sessions";
+const SESSION_DIR = path.resolve(
+  process.env.SESSION_DIR || "./sessions"
+);
 
 if (!fs.existsSync(SESSION_DIR)) {
   fs.mkdirSync(SESSION_DIR, { recursive: true });
 }
 
+/*
+  sessions Map:
+  trackingId = temporary ID used internally for polling
+  publicSessionId = generated only after WhatsApp successfully connects
+*/
 const sessions = new Map();
 
-function createSessionId() {
+function createTrackingId() {
+  return "TRACK-" + crypto.randomBytes(8).toString("hex");
+}
+
+function createPublicSessionId() {
   return "WA-" + crypto.randomBytes(5).toString("hex").toUpperCase();
 }
 
@@ -42,20 +53,37 @@ function isValidPhone(number) {
   return /^\d{8,15}$/.test(number);
 }
 
-async function startWhatsAppSession(sessionId, phoneNumber, method) {
-  const sessionPath = path.join(SESSION_DIR, sessionId);
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function startWhatsAppSession(
+  trackingId,
+  phoneNumber,
+  method
+) {
+  const session = sessions.get(trackingId);
+
+  if (!session) {
+    throw new Error("Session not found.");
+  }
+
+  const sessionPath = path.join(SESSION_DIR, trackingId);
 
   if (!fs.existsSync(sessionPath)) {
     fs.mkdirSync(sessionPath, { recursive: true });
   }
 
-  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+  const { state, saveCreds } =
+    await useMultiFileAuthState(sessionPath);
 
   let version;
+
   try {
     const latest = await fetchLatestBaileysVersion();
     version = latest.version;
-  } catch {
+  } catch (error) {
+    console.log("Using fallback Baileys version.");
     version = [2, 3000, 1015901307];
   }
 
@@ -64,12 +92,11 @@ async function startWhatsAppSession(sessionId, phoneNumber, method) {
     auth: state,
     printQRInTerminal: false,
     logger: P({ level: "silent" }),
-    browser: ["WhatsApp Pairing Web", "Chrome", "1.0.0"],
-    generateHighQualityLinkPreview: false
+    browser: ["SheikhWave", "Chrome", "1.0.0"],
+    generateHighQualityLinkPreview: false,
+    markOnlineOnConnect: false,
+    syncFullHistory: false
   });
-
-  const session = sessions.get(sessionId);
-  if (!session) return;
 
   session.sock = sock;
   session.status = "connecting";
@@ -77,166 +104,154 @@ async function startWhatsAppSession(sessionId, phoneNumber, method) {
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    const current = sessions.get(sessionId);
+    const {
+      connection,
+      lastDisconnect,
+      qr
+    } = update;
+
+    const current = sessions.get(trackingId);
+
     if (!current) return;
 
+    // QR code received
     if (qr) {
       current.qr = qr;
+
       try {
         current.qrDataUrl = await QRCode.toDataURL(qr);
+        current.status = "waiting_for_qr";
       } catch (error) {
+        console.error("QR generation error:", error);
         current.error = "QR generation failed.";
+        current.status = "error";
       }
     }
 
+    // Successfully connected
     if (connection === "open") {
       current.status = "connected";
+
+      // Public Session ID ONLY after successful connection
+      if (!current.publicSessionId) {
+        current.publicSessionId = createPublicSessionId();
+      }
+
       current.qr = null;
       current.qrDataUrl = null;
       current.pairingCode = null;
-      console.log(`[${sessionId}] Connected`);
+      current.error = null;
+
+      console.log(
+        `[${trackingId}] WhatsApp connected`
+      );
+
+      console.log(
+        `[${trackingId}] Session ID: ${current.publicSessionId}`
+      );
     }
 
+    // Connection closed
     if (connection === "close") {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      current.status = "disconnected";
-      console.log(`[${sessionId}] Disconnected: ${statusCode}`);
+      const statusCode =
+        lastDisconnect?.error?.output?.statusCode;
 
-      if (statusCode !== DisconnectReason.loggedOut) {
+      console.log(
+        `[${trackingId}] Disconnected: ${statusCode}`
+      );
+
+      current.status = "disconnected";
+
+      /*
+        Do not reconnect if user logged out.
+        Also do not repeatedly request pairing code.
+      */
+      if (
+        statusCode !== DisconnectReason.loggedOut &&
+        statusCode !== DisconnectReason.connectionReplaced
+      ) {
         setTimeout(() => {
-          if (sessions.has(sessionId)) {
-            startWhatsAppSession(sessionId, phoneNumber, method).catch(console.error);
-          }
-        }, 3000);
+          const activeSession = sessions.get(trackingId);
+
+          if (!activeSession) return;
+
+          startWhatsAppSession(
+            trackingId,
+            phoneNumber,
+            method
+          ).catch((error) => {
+            console.error(
+              "Reconnect error:",
+              error.message
+            );
+          });
+        }, 5000);
       }
     }
   });
 
-  if (!state.creds.registered && method === "pairing") {
+  /*
+    Pairing code:
+    Wait a little after socket creation.
+    This fixes "Unable to generate pairing code" in many cases.
+  */
+  if (
+    !state.creds.registered &&
+    method === "pairing" &&
+    !session.pairingRequested
+  ) {
+    session.pairingRequested = true;
+
     try {
-      // Pairing code should be requested using the normalized international number.
-      const code = await sock.requestPairingCode(phoneNumber);
-      const current = sessions.get(sessionId);
-      if (current) {
-        current.pairingCode = code;
-        current.status = "waiting_for_pairing";
+      // Give Baileys time to initialize
+      await wait(3000);
+
+      const current = sessions.get(trackingId);
+
+      if (!current) return;
+
+      if (current.status === "connected") {
+        return;
+      }
+
+      const code = await sock.requestPairingCode(
+        phoneNumber
+      );
+
+      const updatedSession = sessions.get(trackingId);
+
+      if (updatedSession) {
+        updatedSession.pairingCode = code;
+        updatedSession.status = "waiting_for_pairing";
+        updatedSession.error = null;
+
+        console.log(
+          `[${trackingId}] Pairing code generated: ${code}`
+        );
       }
     } catch (error) {
-      console.error("Pairing code error:", error);
-      const current = sessions.get(sessionId);
+      console.error(
+        `[${trackingId}] Pairing code error:`,
+        error
+      );
+
+      const current = sessions.get(trackingId);
+
       if (current) {
         current.status = "error";
-        current.error = "Unable to generate pairing code. Try again.";
+        current.error =
+          "Unable to generate pairing code. Please try again with a valid number.";
       }
     }
   }
 }
 
+/*
+  Create a new WhatsApp connection
+*/
 app.post("/api/session/create", async (req, res) => {
   try {
-    const { phoneNumber, method } = req.body;
-    const number = normalizePhoneNumber(phoneNumber);
-
-    if (!isValidPhone(number)) {
-      return res.status(400).json({
-        success: false,
-        message: "Enter a valid WhatsApp number with country code."
-      });
-    }
-
-    if (!["qr", "pairing"].includes(method)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid connection method."
-      });
-    }
-
-    const sessionId = createSessionId();
-
-    sessions.set(sessionId, {
-      id: sessionId,
-      phoneNumber: number,
-      method,
-      status: "starting",
-      qr: null,
-      qrDataUrl: null,
-      pairingCode: null,
-      error: null,
-      sock: null,
-      createdAt: Date.now()
-    });
-
-    await startWhatsAppSession(sessionId, number, method);
-    const session = sessions.get(sessionId);
-
-    return res.json({
-      success: true,
-      sessionId,
-      status: session.status,
-      pairingCode: method === "pairing" ? session.pairingCode : null,
-      message: method === "qr"
-        ? "QR session created."
-        : "Pairing session created."
-    });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({
-      success: false,
-      message: "Failed to create WhatsApp session."
-    });
-  }
-});
-
-app.get("/api/session/:sessionId", (req, res) => {
-  const session = sessions.get(req.params.sessionId);
-
-  if (!session) {
-    return res.status(404).json({
-      success: false,
-      message: "Session not found."
-    });
-  }
-
-  res.json({
-    success: true,
-    sessionId: session.id,
-    status: session.status,
-    qrDataUrl: session.qrDataUrl,
-    pairingCode: session.pairingCode,
-    error: session.error
-  });
-});
-
-app.delete("/api/session/:sessionId", async (req, res) => {
-  const sessionId = req.params.sessionId;
-  const session = sessions.get(sessionId);
-
-  if (!session) {
-    return res.status(404).json({
-      success: false,
-      message: "Session not found."
-    });
-  }
-
-  try {
-    if (session.sock) await session.sock.logout();
-  } catch (error) {
-    console.error("Logout error:", error);
-  }
-
-  sessions.delete(sessionId);
-
-  res.json({
-    success: true,
-    message: "Session deleted."
-  });
-});
-
-app.get("*", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
-
-app.listen(PORT, () => {
-  console.log(`WhatsApp Pairing Platform running on port ${PORT}`);
-});
+    const {
+      phoneNumber,
+      method
+    } =
